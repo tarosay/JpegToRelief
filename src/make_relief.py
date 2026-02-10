@@ -22,8 +22,12 @@ BLACK_CUT_DEFAULT = 0.02
 WHITE_CUT_DEFAULT = 0.98
 TONE_GAMMA_DEFAULT = 1.15
 
+# Bright=Thin is default (for backlit transmission)
+INVERT_DEFAULT = True
+
 
 def srgb_to_linear(srgb01: np.ndarray) -> np.ndarray:
+    """sRGB (0..1) -> linear RGB (0..1)"""
     a = 0.055
     return np.where(
         srgb01 <= 0.04045,
@@ -33,24 +37,26 @@ def srgb_to_linear(srgb01: np.ndarray) -> np.ndarray:
 
 
 def luminance_Y_from_linear_rgb(rgb_lin: np.ndarray) -> np.ndarray:
+    """linear RGB -> relative luminance Y (Rec.709 / sRGB primaries)"""
     return (0.2126 * rgb_lin[..., 0] +
             0.7152 * rgb_lin[..., 1] +
             0.0722 * rgb_lin[..., 2])
 
 
 def tone_map(Y: np.ndarray, black_cut: float, white_cut: float, tone_gamma: float) -> np.ndarray:
+    """clip + gentle tone curve (works in linear luminance domain)"""
     if white_cut <= black_cut:
         raise ValueError("white_cut must be > black_cut")
 
     Yc = np.clip((Y - black_cut) / (white_cut - black_cut), 0.0, 1.0)
 
+    # tone_gamma: 1.0 -> no change
     if abs(tone_gamma - 1.0) < 1e-12:
         return Yc
     return np.clip(Yc ** (1.0 / tone_gamma), 0.0, 1.0)
 
 
 def apply_orientation(thickness_mm: np.ndarray, flip_x: bool, flip_y: bool, rot180: bool) -> np.ndarray:
-    # rot180 は flip-x + flip-y と同等（ただし指定の意図を明確にするため残す）
     if rot180:
         flip_x = True
         flip_y = True
@@ -72,10 +78,16 @@ def make_thickness_mm(
     black_cut: float,
     white_cut: float,
     tone_gamma: float,
+    invert: bool,
     flip_x: bool,
     flip_y: bool,
     rot180: bool
 ) -> tuple[np.ndarray, float]:
+    """
+    Returns:
+      thickness_mm: (H,W) float32, total thickness in mm (bottom z=0)
+      px_mm: pixel size in mm
+    """
     img = Image.open(img_path).convert("RGB")
 
     w, h = img.size
@@ -87,9 +99,13 @@ def make_thickness_mm(
     Y = luminance_Y_from_linear_rgb(rgb_lin)
     Yt = tone_map(Y, black_cut, white_cut, tone_gamma)
 
-    thickness_mm = base_thick_mm + relief_mm * Yt
+    # Bright=Thin (invert) is the default for backlit transmission:
+    # thickness = base + relief * (1 - Yt)
+    # Otherwise (non-invert): thickness = base + relief * Yt
+    v = (1.0 - Yt) if invert else Yt
+    thickness_mm = base_thick_mm + relief_mm * v
 
-    # ★PNG/NPY/STLの向きをここで完全に一致させる
+    # Orientation is applied in array domain so PNG/NPY/STL always match
     thickness_mm = apply_orientation(thickness_mm, flip_x=flip_x, flip_y=flip_y, rot180=rot180)
 
     px_mm = float(target_width_mm) / float(target_width_px)
@@ -97,6 +113,7 @@ def make_thickness_mm(
 
 
 def save_heightmap(thickness_mm: np.ndarray, out_png16: Path, out_npy: Path):
+    """Save normalized 16-bit PNG + raw mm values as .npy"""
     tmin = float(thickness_mm.min())
     tmax = float(thickness_mm.max())
     norm = (thickness_mm - tmin) / max(1e-9, (tmax - tmin))
@@ -110,6 +127,7 @@ def save_heightmap(thickness_mm: np.ndarray, out_png16: Path, out_npy: Path):
 
 
 def heightmap_to_stl(thickness_mm: np.ndarray, px_mm: float, out_stl: Path):
+    """Create a solid STL: top surface=thickness_mm, bottom=0, with side walls."""
     if trimesh is None:
         raise RuntimeError("trimesh がありません。pip install trimesh してください。")
 
@@ -152,7 +170,7 @@ def heightmap_to_stl(thickness_mm: np.ndarray, px_mm: float, out_stl: Path):
     top = lambda k: k
     bot = lambda k: offset + k
 
-    # Side walls
+    # Side walls (perimeter)
     for j in range(W - 1):  # top edge i=0
         a, b = idx(0, j), idx(0, j + 1)
         faces += [[top(a), top(b), bot(a)], [top(b), bot(b), bot(a)]]
@@ -175,6 +193,13 @@ def heightmap_to_stl(thickness_mm: np.ndarray, px_mm: float, out_stl: Path):
 
 
 def resolve_out_base(in_path: Path, out_opt: str | None, width_mm: float) -> Path:
+    """
+    Output base path (without extension).
+    Default: <input_dir>/<input_stem>_W<width_mm>mm
+    If --out is given:
+      - absolute path: use as-is (no extension expected)
+      - relative path: resolve under input_dir
+    """
     input_dir = in_path.parent
     if out_opt is None:
         return input_dir / f"{in_path.stem}_W{width_mm:g}mm"
@@ -187,7 +212,7 @@ def resolve_out_base(in_path: Path, out_opt: str | None, width_mm: float) -> Pat
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Image -> luminance -> thickness relief -> STL (outputs next to input image)."
+        description="Image -> linear luminance -> thickness relief -> STL (outputs next to input image)."
     )
 
     ap.add_argument("-i", "--in", dest="in_path", required=True,
@@ -209,6 +234,10 @@ def main():
                     help=f"White cut (default: {WHITE_CUT_DEFAULT})")
     ap.add_argument("--tone", type=float, default=TONE_GAMMA_DEFAULT,
                     help=f"Tone gamma (1.0 = linear). default: {TONE_GAMMA_DEFAULT}")
+
+    # Bright=Thin (invert) is default. Use --no-invert to make Bright=Thick.
+    ap.add_argument("--invert", action=argparse.BooleanOptionalAction, default=INVERT_DEFAULT,
+                    help="Invert mapping. Invert=ON: bright->thin (default). Invert=OFF: bright->thick.")
 
     ap.add_argument("--flip-x", action="store_true", help="Mirror left-right.")
     ap.add_argument("--flip-y", action="store_true", help="Mirror top-bottom.")
@@ -238,6 +267,7 @@ def main():
         black_cut=args.black,
         white_cut=args.white,
         tone_gamma=args.tone,
+        invert=args.invert,
         flip_x=args.flip_x,
         flip_y=args.flip_y,
         rot180=args.rot180
