@@ -1,218 +1,251 @@
-const $ = (id) => document.getElementById(id);
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { STLLoader } from 'three/addons/loaders/STLLoader.js';
 
+// --- DOM Elements ---
+const $ = (id) => document.getElementById(id);
 const fileEl = $("file");
 const dropzone = $("dropzone");
 const btnEl = $("btn");
 const statusEl = $("status");
 const outnameEl = $("outname");
-const canvas = $("preview");
-const ctx = canvas.getContext("2d", { willReadFrequently: true });
+const innameEl = $("inname");
+const canvas2d = $("preview2d"); // index.htmlの2D用canvas
+const ctx2d = canvas2d ? canvas2d.getContext("2d") : null;
 
+// 3D/Loading要素（HTMLに後述の追加が必要）
+const loadingEl = $("loading");
+const container = $("preview3d");
+
+// --- State ---
 let loadedImage = null;
 let loadedName = "image";
+let scene, camera, renderer, controls, currentMesh;
+let updateTimer = null;
 
+// --- 3D Scene Setup ---
+function init3D() {
+    if (!container) return; // コンテナがない場合はスキップ
+
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x111111);
+
+    camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 1000);
+    camera.position.set(0, 0, 150);
+
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(container.clientWidth, container.clientHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    container.appendChild(renderer.domElement);
+
+    controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+    dirLight.position.set(50, 50, 100);
+    scene.add(dirLight);
+
+    animate();
+}
+
+function animate() {
+    requestAnimationFrame(animate);
+    if (controls) controls.update();
+    if (renderer) renderer.render(scene, camera);
+}
+
+// Window resize
+window.addEventListener('resize', () => {
+    if (!camera || !renderer || !container) return;
+    camera.aspect = container.clientWidth / container.clientHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(container.clientWidth, container.clientHeight);
+});
+
+// 初期化実行
+init3D();
+
+// --- Event Listeners ---
 function setStatus(s) { statusEl.textContent = s; }
 
 fileEl.addEventListener("change", async () => {
     const f = fileEl.files?.[0];
-    if (!f) return;
-    await setImageFile(f);
+    if (f) await handleFile(f);
 });
 
 // Drag & Drop
 ["dragenter", "dragover"].forEach(evt => {
-    dropzone.addEventListener(evt, (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        dropzone.style.borderColor = "#111";
-    });
+    dropzone.addEventListener(evt, (e) => { e.preventDefault(); dropzone.style.borderColor = "#3b82f6"; });
 });
-
 ["dragleave", "drop"].forEach(evt => {
-    dropzone.addEventListener(evt, (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        dropzone.style.borderColor = "#888";
+    dropzone.addEventListener(evt, (e) => { e.preventDefault(); dropzone.style.borderColor = "#888"; });
+});
+dropzone.addEventListener("drop", async (e) => {
+    e.preventDefault();
+    const f = e.dataTransfer?.files?.[0];
+    if (f?.type.startsWith("image/")) await handleFile(f);
+});
+
+// 設定変更時にプレビューを更新 (Debounce)
+const inputIds = ["widthPx", "baseMm", "reliefMm", "blackCut", "whiteCut", "toneGamma", "mapInvert", "flipX", "flipY", "rot180"];
+inputIds.forEach(id => {
+    $(id).addEventListener("change", () => {
+        if (!loadedImage) return;
+        if (updateTimer) clearTimeout(updateTimer);
+        updateTimer = setTimeout(updatePreviews, 400);
     });
 });
 
-dropzone.addEventListener("drop", async (e) => {
-    const f = e.dataTransfer?.files?.[0];
-    if (!f) return;
-    if (!f.type.startsWith("image/")) {
-        setStatus("Not an image file.");
-        return;
-    }
-    await setImageFile(f);
-});
-
-
+// rot180 は flipX+flipY のマクロとして扱う
+// - チェックON  : flipX/flipY もON
+// - チェックOFF : flipX/flipY もOFF（要求仕様）
 $("rot180").addEventListener("change", () => {
-    if ($("rot180").checked) { $("flipX").checked = true; $("flipY").checked = true; }
+    const on = $("rot180").checked;
+    $("flipX").checked = on;
+    $("flipY").checked = on;
 });
 
-["widthPx", "blackCut", "whiteCut", "toneGamma", "mapInvert", "flipX", "flipY", "rot180"].forEach(id => {
-    $(id).addEventListener("change", () => loadedImage && renderPreview());
-});
-
+// Download STL
 btnEl.addEventListener("click", async () => {
     if (!loadedImage) return;
     btnEl.disabled = true;
     try {
-        setStatus("Generating...");
+        setStatus("Generating binary STL...");
         const params = getParams();
         const { thickness, pxMm, H, W } = await computeThicknessMap(loadedImage, params);
-
-        // STL生成（Binary STL）
         const stlBytes = buildBinarySTL(thickness, pxMm, W, H);
         const blob = new Blob([stlBytes], { type: "application/octet-stream" });
-
-        const outBase = `${loadedName}_W${params.widthMm}mm`;
-        const outFile = `${outBase}.stl`;
-        outnameEl.textContent = `Output: ${outFile}`;
-
-        downloadBlob(blob, outFile);
-        setStatus("Done.");
+        downloadBlob(blob, `${loadedName}_W${params.widthMm}mm.stl`);
+        setStatus("Download started.");
     } catch (e) {
-        console.error(e);
-        setStatus("ERROR: " + (e?.message ?? String(e)));
+        setStatus("Error: " + e.message);
     } finally {
         btnEl.disabled = false;
     }
 });
 
-function getParams() {
-    let flipX = $("flipX").checked;
-    let flipY = $("flipY").checked;
-    const rot180 = $("rot180").checked;
-    if (rot180) { flipX = true; flipY = true; }
+// --- Core Logic ---
 
-    return {
-        widthMm: numberVal("widthMm", 100),
-        widthPx: Math.max(10, Math.floor(numberVal("widthPx", 600))),
-        baseMm: numberVal("baseMm", 0.8),
-        reliefMm: numberVal("reliefMm", 1.5),
-        blackCut: numberVal("blackCut", 0.02),
-        whiteCut: numberVal("whiteCut", 0.98),
-        toneGamma: numberVal("toneGamma", 1.15),
-        mapInvert: $("mapInvert")?.checked ?? true,
-        flipX, flipY,
-    };
-}
-function numberVal(id, def) {
-    const v = parseFloat($(id).value);
-    return Number.isFinite(v) ? v : def;
+async function handleFile(f) {
+    loadedName = f.name.replace(/\.[^.]+$/, "");
+    if (innameEl) innameEl.textContent = `Input: ${f.name}`;
+    try {
+        const url = URL.createObjectURL(f);
+        loadedImage = await new Promise((res) => {
+            const img = new Image();
+            img.onload = () => { URL.revokeObjectURL(url); res(img); };
+            img.src = url;
+        });
+        btnEl.disabled = false;
+        setStatus("Image loaded.");
+        updatePreviews();
+    } catch (e) {
+        setStatus("Load failed.");
+    }
 }
 
-function loadImageFromFile(file) {
-    return new Promise((resolve, reject) => {
-        const url = URL.createObjectURL(file);
-        const img = new Image();
-        img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
-        img.onerror = (e) => reject(e);
-        img.src = url;
+async function updatePreviews() {
+    if (!loadedImage) return;
+    if (loadingEl) loadingEl.style.opacity = "1";
+    setStatus("Updating...");
+
+    await new Promise(r => requestAnimationFrame(r)); // UI描画を待機
+
+    const params = getParams();
+    const { thickness, pxMm, H, W } = await computeThicknessMap(loadedImage, params);
+
+    // 1. 2Dプレビュー描画 (canvas)
+    draw2D(thickness, W, H, params);
+
+    // 2. 3Dプレビュー更新 (Three.js)
+    const stlBytes = buildBinarySTL(thickness, pxMm, W, H);
+    const blob = new Blob([stlBytes], { type: 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+
+    new STLLoader().load(url, (geometry) => {
+        if (currentMesh) {
+            scene.remove(currentMesh);
+            currentMesh.geometry.dispose();
+            currentMesh.material.dispose();
+        }
+        geometry.center();
+        geometry.computeVertexNormals();
+        currentMesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.4 }));
+        scene.add(currentMesh);
+        URL.revokeObjectURL(url);
+        if (loadingEl) loadingEl.style.opacity = "0";
+        setStatus("Ready.");
+        if (outnameEl) {
+            outnameEl.textContent = `Target: ${loadedName}_W${params.widthMm}mm.stl`;
+        }
     });
 }
 
-async function renderPreview() {
-    const params = getParams();
-    const { thickness, W, H } = await computeThicknessMap(loadedImage, params);
-
-    // 正規化して8bitで表示（プレビュー用）
-    let tmin = Infinity, tmax = -Infinity;
+function draw2D(thickness, W, H, p) {
+    if (!ctx2d) return;
+    canvas2d.width = W;
+    canvas2d.height = H;
+    const imgData = ctx2d.createImageData(W, H);
+    const data = imgData.data;
     for (let i = 0; i < thickness.length; i++) {
-        const t = thickness[i];
-        if (t < tmin) tmin = t;
-        if (t > tmax) tmax = t;
+        // 最小厚さを0、最大厚さを255としてグレースケール表示
+        const val = ((thickness[i] - p.baseMm) / p.reliefMm) * 255;
+        const idx = i * 4;
+        data[idx] = data[idx + 1] = data[idx + 2] = val;
+        data[idx + 3] = 255;
     }
-    const scale = 1 / Math.max(1e-9, (tmax - tmin));
+    ctx2d.putImageData(imgData, 0, 0);
+}
 
-    // preview canvas size keep aspect
-    const maxW = 600;
-    const pw = maxW;
-    const ph = Math.round(H * (pw / W));
-    canvas.width = pw;
-    canvas.height = ph;
-
-    const imgData = ctx.createImageData(pw, ph);
-    // nearest for preview
-    for (let y = 0; y < ph; y++) {
-        const sy = Math.min(H - 1, Math.floor(y * (H / ph)));
-        for (let x = 0; x < pw; x++) {
-            const sx = Math.min(W - 1, Math.floor(x * (W / pw)));
-            const t = thickness[sy * W + sx];
-            const n = (t - tmin) * scale;
-            const g = Math.max(0, Math.min(255, Math.round(n * 255)));
-            const o = (y * pw + x) * 4;
-            imgData.data[o + 0] = g;
-            imgData.data[o + 1] = g;
-            imgData.data[o + 2] = g;
-            imgData.data[o + 3] = 255;
-        }
-    }
-    ctx.putImageData(imgData, 0, 0);
-
-    const outBase = `${loadedName}_W${params.widthMm}mm`;
-    outnameEl.textContent = `Output: ${outBase}.stl`;
+function getParams() {
+    let flipX = $("flipX").checked;
+    let flipY = $("flipY").checked;
+    if ($("rot180").checked) { flipX = true; flipY = true; }
+    return {
+        widthMm: parseFloat($("widthMm").value) || 100,
+        widthPx: Math.max(10, parseInt($("widthPx").value) || 400),
+        baseMm: parseFloat($("baseMm").value) || 0.8,
+        reliefMm: parseFloat($("reliefMm").value) || 2.0,
+        blackCut: parseFloat($("blackCut").value) || 0,
+        whiteCut: parseFloat($("whiteCut").value) || 1,
+        toneGamma: parseFloat($("toneGamma").value) || 1.0,
+        mapInvert: $("mapInvert").checked,
+        flipX, flipY
+    };
 }
 
 async function computeThicknessMap(img, p) {
-    // draw resized image to offscreen canvas
     const W = p.widthPx;
-    const H = Math.max(1, Math.round(img.height * (W / img.width)));
-
+    const H = Math.round(img.height * (W / img.width));
     const off = document.createElement("canvas");
-    off.width = W;
-    off.height = H;
-    const octx = off.getContext("2d", { willReadFrequently: true });
+    off.width = W; off.height = H;
+    const octx = off.getContext("2d");
     octx.drawImage(img, 0, 0, W, H);
     const { data } = octx.getImageData(0, 0, W, H);
 
     const thickness = new Float32Array(W * H);
-
-    const blackCut = p.blackCut;
-    const whiteCut = p.whiteCut;
-    const invRange = 1 / Math.max(1e-9, (whiteCut - blackCut));
-    const toneGamma = p.toneGamma;
-
-    // pixel size in mm
     const pxMm = p.widthMm / W;
+    const invRange = 1 / Math.max(1e-9, (p.whiteCut - p.blackCut));
 
-    // For each pixel: sRGB->linear, luminance Y, tone, thickness
     for (let y = 0; y < H; y++) {
         for (let x = 0; x < W; x++) {
             const i = (y * W + x) * 4;
-            const sr = data[i] / 255;
-            const sg = data[i + 1] / 255;
-            const sb = data[i + 2] / 255;
+            const r = data[i] / 255, g = data[i + 1] / 255, b = data[i + 2] / 255;
+            // Luminance
+            let Y = 0.2126 * srgbToLinear(r) + 0.7152 * srgbToLinear(g) + 0.0722 * srgbToLinear(b);
+            Y = Math.max(0, Math.min(1, (Y - p.blackCut) * invRange));
+            if (p.toneGamma !== 1) Y = Math.pow(Y, 1 / p.toneGamma);
 
-            const lr = srgbToLinear(sr);
-            const lg = srgbToLinear(sg);
-            const lb = srgbToLinear(sb);
+            const v = p.mapInvert ? (1.0 - Y) : Y;
+            const t = p.baseMm + p.reliefMm * v;
 
-            // luminance (Rec.709)
-            let Y = 0.2126 * lr + 0.7152 * lg + 0.0722 * lb;
-
-            // clip normalize
-            Y = Math.max(0, Math.min(1, (Y - blackCut) * invRange));
-
-            // tone curve (1.0 = linear)
-            if (Math.abs(toneGamma - 1.0) > 1e-9) {
-                Y = Math.pow(Y, 1.0 / toneGamma);
-            }
-
-            const v = (p.mapInvert ?? true) ? (1.0 - Y) : Y;
-            let t = p.baseMm + p.reliefMm * v;
-
-            // apply orientation in array domain so PNG/STL consistency is guaranteed
             let ox = x, oy = y;
-            if (p.flipX) ox = (W - 1 - ox);
-            if (p.flipY) oy = (H - 1 - oy);
-
+            if (p.flipX) ox = (W - 1 - x);
+            if (p.flipY) oy = (H - 1 - y);
             thickness[oy * W + ox] = t;
         }
     }
-
     return { thickness, pxMm, W, H };
 }
 
@@ -220,141 +253,56 @@ function srgbToLinear(u) {
     return (u <= 0.04045) ? (u / 12.92) : Math.pow((u + 0.055) / 1.055, 2.4);
 }
 
-function downloadBlob(blob, filename) {
+function buildBinarySTL(thickness, pxMm, W, H) {
+    const vx = (x) => x * pxMm;
+    const vy = (y) => (H - 1 - y) * pxMm;
+    const vz = (x, y) => thickness[y * W + x];
+
+    const triCount = (W - 1) * (H - 1) * 4 + (W - 1) * 4 + (H - 1) * 4; // 大まかな計算
+    const buf = new ArrayBuffer(84 + 50 * (W - 1) * (H - 1) * 12); // 十分なバッファ
+    const view = new DataView(buf);
+    view.setUint32(80, 0, true); // 後で書き換える
+
+    let off = 84, count = 0;
+    const writeTri = (ax, ay, az, bx, by, bz, cx, cy, cz) => {
+        off += 12; // Skip normal
+        view.setFloat32(off, ax, true); view.setFloat32(off + 4, ay, true); view.setFloat32(off + 8, az, true);
+        view.setFloat32(off + 12, bx, true); view.setFloat32(off + 16, by, true); view.setFloat32(off + 20, bz, true);
+        view.setFloat32(off + 24, cx, true); view.setFloat32(off + 28, cy, true); view.setFloat32(off + 32, cz, true);
+        off += 38; count++;
+    };
+
+    for (let y = 0; y < H - 1; y++) {
+        for (let x = 0; x < W - 1; x++) {
+            // Top
+            writeTri(vx(x), vy(y), vz(x, y), vx(x), vy(y + 1), vz(x, y + 1), vx(x + 1), vy(y), vz(x + 1, y));
+            writeTri(vx(x + 1), vy(y), vz(x + 1, y), vx(x), vy(y + 1), vz(x, y + 1), vx(x + 1), vy(y + 1), vz(x + 1, y + 1));
+            // Bottom
+            writeTri(vx(x), vy(y), 0, vx(x + 1), vy(y), 0, vx(x), vy(y + 1), 0);
+            writeTri(vx(x + 1), vy(y), 0, vx(x + 1), vy(y + 1), 0, vx(x), vy(y + 1), 0);
+        }
+    }
+    // Sides
+    for (let x = 0; x < W - 1; x++) {
+        writeTri(vx(x), vy(0), vz(x, 0), vx(x + 1), vy(0), vz(x + 1, 0), vx(x), vy(0), 0);
+        writeTri(vx(x + 1), vy(0), vz(x + 1, 0), vx(x + 1), vy(0), 0, vx(x), vy(0), 0);
+        writeTri(vx(x), vy(H - 1), vz(x, H - 1), vx(x), vy(H - 1), 0, vx(x + 1), vy(H - 1), vz(x + 1, H - 1));
+        writeTri(vx(x + 1), vy(H - 1), vz(x + 1, H - 1), vx(x), vy(H - 1), 0, vx(x + 1), vy(H - 1), 0);
+    }
+    for (let y = 0; y < H - 1; y++) {
+        writeTri(vx(0), vy(y), vz(0, y), vx(0), vy(y), 0, vx(0), vy(y + 1), vz(0, y + 1));
+        writeTri(vx(0), vy(y + 1), vz(0, y + 1), vx(0), vy(y), 0, vx(0), vy(y + 1), 0);
+        writeTri(vx(W - 1), vy(y), vz(W - 1, y), vx(W - 1), vy(y + 1), vz(W - 1, y + 1), vx(W - 1), vy(y), 0);
+        writeTri(vx(W - 1), vy(y + 1), vz(W - 1, y + 1), vx(W - 1), vy(y + 1), 0, vx(W - 1), vy(y), 0);
+    }
+
+    view.setUint32(80, count, true);
+    return buf.slice(0, off);
+}
+
+function downloadBlob(blob, name) {
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = filename;
-    document.body.appendChild(a);
+    a.download = name;
     a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-}
-
-/**
- * Build Binary STL for a solid surface:
- * - top surface: z = thickness
- * - bottom: z = 0
- * - side walls around perimeter
- *
- * Note: normals are set to (0,0,0) (allowed). Most slicers recompute normals.
- */
-function buildBinarySTL(thickness, pxMm, W, H) {
-    // helper: vertex at grid
-    const vx = (x) => (W - 1 - x) * pxMm;
-    const vy = (y) => y * pxMm;
-    const vzTop = (x, y) => thickness[y * W + x];
-
-    // Count triangles:
-    // top: (W-1)*(H-1)*2
-    // bottom: same
-    // sides: perimeter quads *2
-    const topTris = (W - 1) * (H - 1) * 2;
-    const bottomTris = topTris;
-    const sideTris = ((W - 1) * 2 + (H - 1) * 2) * 2;
-    const triCount = topTris + bottomTris + sideTris;
-
-    const header = new Uint8Array(80); // zeros
-    const buf = new ArrayBuffer(84 + triCount * 50);
-    const view = new DataView(buf);
-
-    // header
-    new Uint8Array(buf, 0, 80).set(header);
-    view.setUint32(80, triCount, true);
-
-    let off = 84;
-
-    function writeTri(ax, ay, az, bx, by, bz, cx, cy, cz) {
-        // normal (0,0,0)
-        view.setFloat32(off + 0, 0, true);
-        view.setFloat32(off + 4, 0, true);
-        view.setFloat32(off + 8, 0, true);
-
-        view.setFloat32(off + 12, ax, true);
-        view.setFloat32(off + 16, ay, true);
-        view.setFloat32(off + 20, az, true);
-
-        view.setFloat32(off + 24, bx, true);
-        view.setFloat32(off + 28, by, true);
-        view.setFloat32(off + 32, bz, true);
-
-        view.setFloat32(off + 36, cx, true);
-        view.setFloat32(off + 40, cy, true);
-        view.setFloat32(off + 44, cz, true);
-
-        view.setUint16(off + 48, 0, true); // attribute
-        off += 50;
-    }
-
-    // Top surface
-    for (let y = 0; y < H - 1; y++) {
-        for (let x = 0; x < W - 1; x++) {
-            const a = [vx(x), vy(y), vzTop(x, y)];
-            const b = [vx(x + 1), vy(y), vzTop(x + 1, y)];
-            const c = [vx(x), vy(y + 1), vzTop(x, y + 1)];
-            const d = [vx(x + 1), vy(y + 1), vzTop(x + 1, y + 1)];
-            // (a,c,b) and (b,c,d) same as Python版
-            writeTri(...a, ...c, ...b);
-            writeTri(...b, ...c, ...d);
-        }
-    }
-
-    // Bottom surface (reverse)
-    for (let y = 0; y < H - 1; y++) {
-        for (let x = 0; x < W - 1; x++) {
-            const a = [vx(x), vy(y), 0];
-            const b = [vx(x + 1), vy(y), 0];
-            const c = [vx(x), vy(y + 1), 0];
-            const d = [vx(x + 1), vy(y + 1), 0];
-            // (a,b,c) and (b,d,c)
-            writeTri(...a, ...b, ...c);
-            writeTri(...b, ...d, ...c);
-        }
-    }
-
-    // Side walls: top edge y=0
-    for (let x = 0; x < W - 1; x++) {
-        const aT = [vx(x), vy(0), vzTop(x, 0)];
-        const bT = [vx(x + 1), vy(0), vzTop(x + 1, 0)];
-        const aB = [vx(x), vy(0), 0];
-        const bB = [vx(x + 1), vy(0), 0];
-        writeTri(...aT, ...bT, ...aB);
-        writeTri(...bT, ...bB, ...aB);
-    }
-    // bottom edge y=H-1
-    for (let x = 0; x < W - 1; x++) {
-        const aT = [vx(x), vy(H - 1), vzTop(x, H - 1)];
-        const bT = [vx(x + 1), vy(H - 1), vzTop(x + 1, H - 1)];
-        const aB = [vx(x), vy(H - 1), 0];
-        const bB = [vx(x + 1), vy(H - 1), 0];
-        // mirror of Python winding used earlier:
-        writeTri(...bT, ...aT, ...aB);
-        writeTri(...aB, ...bB, ...bT);
-    }
-    // left edge x=0
-    for (let y = 0; y < H - 1; y++) {
-        const aT = [vx(0), vy(y), vzTop(0, y)];
-        const bT = [vx(0), vy(y + 1), vzTop(0, y + 1)];
-        const aB = [vx(0), vy(y), 0];
-        const bB = [vx(0), vy(y + 1), 0];
-        writeTri(...bT, ...aT, ...aB);
-        writeTri(...aB, ...bB, ...bT);
-    }
-    // right edge x=W-1
-    for (let y = 0; y < H - 1; y++) {
-        const aT = [vx(W - 1), vy(y), vzTop(W - 1, y)];
-        const bT = [vx(W - 1), vy(y + 1), vzTop(W - 1, y + 1)];
-        const aB = [vx(W - 1), vy(y), 0];
-        const bB = [vx(W - 1), vy(y + 1), 0];
-        writeTri(...aT, ...bT, ...aB);
-        writeTri(...bT, ...bB, ...aB);
-    }
-
-    return buf;
-}
-async function setImageFile(f) {
-    loadedName = f.name.replace(/\.[^.]+$/, "");
-    loadedImage = await loadImageFromFile(f);
-    btnEl.disabled = false;
-    setStatus("Image loaded.");
-    await renderPreview();
 }
